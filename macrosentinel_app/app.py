@@ -12,6 +12,7 @@
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
+import time
 from flask import Flask, jsonify, render_template
 from flask_cors import CORS
 import yfinance as yf
@@ -41,6 +42,40 @@ except Exception as e:
     print("  Run macrosentinel_v3_final.py first to train and save the model.")
 
 # ============================================================
+# 1b. Browser-impersonating session for yfinance
+#    Yahoo Finance often blocks/rate-limits requests coming from
+#    cloud server IPs (Render, Railway, Streamlit Cloud, etc).
+#    curl_cffi impersonates a real Chrome browser's TLS fingerprint
+#    to reduce the chance of being blocked. Falls back to yfinance's
+#    default session if curl_cffi isn't available.
+# ============================================================
+try:
+    from curl_cffi import requests as cffi_requests
+    YF_SESSION = cffi_requests.Session(impersonate="chrome")
+    print("✅ Using curl_cffi browser-impersonating session for yfinance")
+except ImportError:
+    YF_SESSION = None
+    print("⚠ curl_cffi not available, using yfinance's default session")
+
+def yf_download_with_retry(sym, start, end, interval, max_retries=3):
+    """Retries a yfinance download a few times with a short pause,
+    since Yahoo Finance occasionally rate-limits or blips on the
+    first attempt from cloud server IPs."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            kwargs = dict(start=start, end=end, interval=interval, progress=False)
+            if YF_SESSION is not None:
+                kwargs['session'] = YF_SESSION
+            df = yf.download(sym, **kwargs)
+            if df is not None and len(df) > 0:
+                return df
+            print(f"  ⚠ Attempt {attempt}/{max_retries} for {sym}: 0 rows, retrying...")
+        except Exception as e:
+            print(f"  ⚠ Attempt {attempt}/{max_retries} for {sym} failed: {e}")
+        time.sleep(2)
+    return pd.DataFrame()  # empty if all retries failed
+
+# ============================================================
 # 2. Helper — fetch and prepare data
 # ============================================================
 SYMBOLS   = ['EURUSD=X', 'GBPUSD=X']
@@ -57,11 +92,16 @@ def fetch_and_prepare():
 
     data = {}
     for sym in SYMBOLS:
-        df = yf.download(sym,
-                         start=start_date.strftime('%Y-%m-%d'),
-                         end=end_date.strftime('%Y-%m-%d'),
-                         interval='1h',
-                         progress=False)
+        df = yf_download_with_retry(sym,
+                                     start_date.strftime('%Y-%m-%d'),
+                                     end_date.strftime('%Y-%m-%d'),
+                                     '1h')
+        if len(df) == 0:
+            raise RuntimeError(
+                f"Could not download data for {sym} after multiple retries. "
+                f"Yahoo Finance may be temporarily blocking this server's IP — "
+                f"try again in a moment."
+            )
         df = df[['Close']].rename(columns={'Close': sym})
         data[sym] = df
 
@@ -135,9 +175,10 @@ def prices():
         start = end - timedelta(days=5)
         prices_data = {}
         for sym in SYMBOLS:
-            df = yf.download(sym, start=start.strftime('%Y-%m-%d'),
-                             end=end.strftime('%Y-%m-%d'),
-                             interval='1h', progress=False)
+            df = yf_download_with_retry(sym, start.strftime('%Y-%m-%d'),
+                                         end.strftime('%Y-%m-%d'), '1h')
+            if len(df) < 2:
+                raise RuntimeError(f"Could not download recent data for {sym}")
             prices_data[sym] = {
                 'price': round(float(df['Close'].iloc[-1]), 5),
                 'prev':  round(float(df['Close'].iloc[-2]), 5)
@@ -276,3 +317,4 @@ def predict():
 if __name__ == '__main__':
     print("\n🚀 MacroSentinel API running at http://127.0.0.1:5000\n")
     app.run(debug=True, port=5000)
+
