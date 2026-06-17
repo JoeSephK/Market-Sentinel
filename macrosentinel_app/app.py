@@ -28,6 +28,31 @@ app = Flask(__name__)
 CORS(app)   # allows the frontend to call this API from any origin
 
 # ============================================================
+# 0. Simple in-memory cache
+#    Avoids re-downloading data and re-running the LSTM on every
+#    single request. This matters for two reasons:
+#    1. Yahoo Finance rate-limits repeated requests from the same
+#       server IP — caching means most clicks don't hit Yahoo at all.
+#    2. The full predict pipeline is slow (~60-90s); caching keeps
+#       repeat requests fast and avoids gunicorn worker timeouts.
+#    Cache resets when the server restarts; that's fine for our use.
+# ============================================================
+CACHE = {}
+CACHE_TTL_SECONDS = 300  # 5 minutes — long enough to survive rapid clicking during a demo
+
+def get_cached(key):
+    entry = CACHE.get(key)
+    if entry is None:
+        return None
+    value, timestamp = entry
+    if time.time() - timestamp > CACHE_TTL_SECONDS:
+        return None
+    return value
+
+def set_cached(key, value):
+    CACHE[key] = (value, time.time())
+
+# ============================================================
 # 1. Load model once at startup (not on every request)
 # ============================================================
 MODEL_PATH = 'macrosentinel_model.keras'
@@ -135,10 +160,10 @@ def fetch_and_prepare():
     y_test   = y[split:]
 
     # Latest raw prices for the price ticker
-    latest_eur = float(df_all['EURUSD=X'].iloc[-1])
-    prev_eur   = float(df_all['EURUSD=X'].iloc[-2])
-    latest_gbp = float(df_all['GBPUSD=X'].iloc[-1])
-    prev_gbp   = float(df_all['GBPUSD=X'].iloc[-2])
+    latest_eur = float(df_all['EURUSD=X'].iloc[-1:].values[0])
+    prev_eur   = float(df_all['EURUSD=X'].iloc[-2:-1].values[0])
+    latest_gbp = float(df_all['GBPUSD=X'].iloc[-1:].values[0])
+    prev_gbp   = float(df_all['GBPUSD=X'].iloc[-2:-1].values[0])
 
     return X_test, y_test, scaler, df_all, split, {
         'eur': latest_eur, 'eur_prev': prev_eur,
@@ -170,6 +195,10 @@ def prices():
     Returns the latest EUR/USD and GBP/USD prices quickly,
     without running the full model — for the live price ticker.
     """
+    cached = get_cached('prices')
+    if cached is not None:
+        return jsonify(cached)
+
     try:
         end   = datetime.today()
         start = end - timedelta(days=5)
@@ -180,8 +209,8 @@ def prices():
             if len(df) < 2:
                 raise RuntimeError(f"Could not download recent data for {sym}")
             prices_data[sym] = {
-                'price': round(float(df['Close'].iloc[-1]), 5),
-                'prev':  round(float(df['Close'].iloc[-2]), 5)
+                'price': round(float(df['Close'].iloc[-1:].values[0]), 5),
+                'prev':  round(float(df['Close'].iloc[-2:-1].values[0]), 5)
             }
 
         eur      = prices_data['EURUSD=X']['price']
@@ -189,7 +218,10 @@ def prices():
         gbp      = prices_data['GBPUSD=X']['price']
         gbp_prev = prices_data['GBPUSD=X']['prev']
 
-        return jsonify({
+        result = {
+            'status': 'ok',
+            'timestamp': datetime.now().isoformat(),
+        result = {
             'status': 'ok',
             'timestamp': datetime.now().isoformat(),
             'EURUSD': {
@@ -202,7 +234,9 @@ def prices():
                 'change': round(gbp - gbp_prev, 5),
                 'change_pct': round((gbp - gbp_prev) / gbp_prev * 100, 4)
             }
-        })
+        }
+        set_cached('prices', result)
+        return jsonify(result)
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
@@ -221,6 +255,10 @@ def predict():
             'status': 'error',
             'message': 'Model not loaded. Run macrosentinel_v3_final.py first.'
         }), 503
+
+    cached = get_cached('predict')
+    if cached is not None:
+        return jsonify(cached)
 
     try:
         X_test, y_test, scaler, df_all, split, px = fetch_and_prepare()
@@ -266,7 +304,7 @@ def predict():
 
         # ── Return last 72 points for chart ────────────────
         n_chart = min(72, len(actual))
-        return jsonify({
+        result = {
             'status':    'ok',
             'timestamp': datetime.now().isoformat(),
             'chart': {
@@ -305,7 +343,9 @@ def predict():
                 }
             },
             'prices': px
-        })
+        }
+        set_cached('predict', result)
+        return jsonify(result)
 
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
